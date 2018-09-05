@@ -16,8 +16,15 @@
 #include <linux/kernel.h>         // Contains types, macros, functions for the kernel
 #include <linux/fs.h>             // Header for the Linux file system support
 #include <linux/uaccess.h>          // Required for the copy to user function
+#include <linux/spi/spi.h>
+
 #define  DEVICE_NAME "ebbchar"    ///< The device will appear at /dev/ebbchar using this value
 #define  CLASS_NAME  "ebb"        ///< The device class -- this is a character device driver
+
+#define SPI_SPEED_HZ 1000000
+#define SPI_BUS_NO 1
+#define SPI_CS_NO	1
+#define SPI_BITS_PER_WORD 8
 
 MODULE_LICENSE("GPL");            ///< The license type -- this affects available functionality
 MODULE_AUTHOR("Derek Molloy");    ///< The author -- visible when you use modinfo
@@ -30,6 +37,15 @@ static short  size_of_message;              ///< Used to remember the size of th
 static int    numberOpens = 0;              ///< Counts the number of times the device is opened
 static struct class*  ebbcharClass  = NULL; ///< The device-driver class struct pointer
 static struct device* ebbcharDevice = NULL; ///< The device-driver device struct pointer
+
+static struct spi_device *samcon_device;
+struct spi_board_info samcon_device_info = {
+		.modalias = "samcon",
+		.max_speed_hz = SPI_SPEED_HZ,
+		.bus_num = SPI_BUS_NO,
+		.chip_select = SPI_CS_NO,
+		.mode = 0,
+};
 
 // The prototype functions for the character driver -- must come before the struct definition
 static int     dev_open(struct inode *, struct file *);
@@ -56,6 +72,10 @@ static struct file_operations fops =
  *  @return returns 0 if successful
  */
 static int __init ebbchar_init(void){
+
+	struct spi_master *master;
+	int ret;
+
    printk(KERN_INFO "EBBChar: Initializing the EBBChar LKM\n");
 
    // Try to dynamically allocate a major number for the device -- more difficult but worth it
@@ -84,6 +104,24 @@ static int __init ebbchar_init(void){
       return PTR_ERR(ebbcharDevice);
    }
    printk(KERN_INFO "EBBChar: device class created correctly\n"); // Made it! device was initialized
+
+	master = spi_busnum_to_master( samcon_device_info.bus_num );
+	if( !master )
+		return -ENODEV;
+
+	samcon_device = spi_new_device( master, &samcon_device_info );
+	if( !samcon_device )
+		return -ENODEV;
+
+	samcon_device->bits_per_word = SPI_BITS_PER_WORD;
+
+	ret = spi_setup( samcon_device );
+	if( ret )
+		spi_unregister_device( samcon_device );
+	else
+		printk( KERN_INFO "SAMCON registered to SPI bus %u, chipselect %u\n", 
+		SPI_BUS_NO, SPI_CS_NO );
+
    return 0;
 }
 
@@ -92,6 +130,9 @@ static int __init ebbchar_init(void){
  *  code is used for a built-in driver (not a LKM) that this function is not required.
  */
 static void __exit ebbchar_exit(void){
+
+	spi_unregister_device( samcon_device );
+
    device_destroy(ebbcharClass, MKDEV(majorNumber, 0));     // remove the device
    class_unregister(ebbcharClass);                          // unregister the device class
    class_destroy(ebbcharClass);                             // remove the device class
@@ -120,8 +161,12 @@ static int dev_open(struct inode *inodep, struct file *filep){
  */
 static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset){
    int error_count = 0;
+   uint8_t data[2];
    // copy_to_user has the format ( * to, *from, size) and returns 0 on success
    error_count = copy_to_user(buffer, message, size_of_message);
+
+   spi_read(samcon_device, data, 2);
+   printk(KERN_INFO "received %d, %d", data[0], data[1]);
 
    if (error_count==0){            // if true then have success
       printk(KERN_INFO "EBBChar: Sent %d characters to the user\n", size_of_message);
@@ -142,9 +187,15 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
  *  @param offset The offset if required
  */
 static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset){
+
+   uint16_t write_data = 0xAA55;
+
    sprintf(message, "%s(%zu letters)", buffer, len);   // appending received string with its length
    size_of_message = strlen(message);                 // store the length of the stored message
    printk(KERN_INFO "EBBChar: Received %zu characters from the user\n", len);
+
+   spi_write( samcon_device, &write_data, sizeof write_data );
+
    return len;
 }
 
