@@ -1,10 +1,6 @@
 /*
  * Simple synchronous userspace interface to SPI devices
  *
- * Copyright (C) 2006 SWAPP
- *	Andrea Paterniani <a.paterniani@swapp-eng.it>
- * Copyright (C) 2007 David Brownell (simplification, cleanup)
- *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -54,15 +50,21 @@
 
 static DECLARE_BITMAP(minors, N_SPI_MINORS);
 
-static struct spi_device *samcon_device;
+static struct spi_device *spi;
 
-struct spi_board_info samcon_device_info = {
+struct spi_board_info spi_device_info = {
 		.modalias = "spidev",
 		.max_speed_hz = 10000000,
 		.bus_num = 1,
 		.chip_select = 1,
 		.mode = 0,
 };
+
+/* The main reason to have this class is to make mdev/udev create the
+ * /dev/spidevB.C character device nodes exposing our userspace API.
+ * It also simplifies memory management.
+ */
+static struct class *spidev_class;
 
 /* Bit masks for spi_device.mode management.  Note that incorrect
  * settings for some settings can cause *lots* of trouble for other
@@ -664,24 +666,76 @@ static const struct file_operations spidev_fops = {
 
 /*-------------------------------------------------------------------------*/
 
-/* The main reason to have this class is to make mdev/udev create the
- * /dev/spidevB.C character device nodes exposing our userspace API.
- * It also simplifies memory management.
- */
 
-static struct class *spidev_class;
 
-static int spidev_probe(struct spi_device *spi)
+static struct spi_driver spidev_spi_driver = {
+	.driver = {
+		.name =		"spidev",
+	},
+
+	/* NOTE:  suspend/resume methods are not necessary here.
+	 * We don't do anything except pass the requests to/from
+	 * the underlying controller.  The refrigerator handles
+	 * most issues; the controller driver handles the rest.
+	 */
+};
+
+/*-------------------------------------------------------------------------*/
+
+static int __init spidev_init(void)
 {
+	int status;
 	struct spidev_data	*spidev;
-	int			status;
 	unsigned long		minor;
+	struct spi_master *master;
 
+	/* Claim our 256 reserved device numbers.  Then register a class
+	 * that will key udev/mdev to add/remove /dev nodes.  Last, register
+	 * the driver which manages those device numbers.
+	 */
+	BUILD_BUG_ON(N_SPI_MINORS > 256);
+
+	status = register_chrdev(SPIDEV_MAJOR, "spi", &spidev_fops);
+	if (status < 0)
+		return status;
+	printk(KERN_INFO "register_chrdev completed successfully\n");
+	spidev_class = class_create(THIS_MODULE, "spidev");
+
+	if (IS_ERR(spidev_class)) {
+		unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
+		return PTR_ERR(spidev_class);
+	}
+
+	printk(KERN_INFO "class_create completed successfully\n");
+	status = spi_register_driver(&spidev_spi_driver);
+
+	if (status < 0) {
+		class_destroy(spidev_class);
+		unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
+		return status;
+	}
+
+	printk(KERN_INFO "spi_register_driver completed successfully\n");
+
+	/*End of original init here. We need to create an spi_device spi*/
+
+	master = spi_busnum_to_master( spi_device_info.bus_num );
+	if( !master )
+		return -ENODEV;
+
+	printk(KERN_INFO "spi_busnum_to_master completed successfully\n");
+	spi = spi_new_device( master, &spi_device_info );
+	if( !spi )
+		return -ENODEV;
+
+	printk(KERN_INFO "spi_new_device completed successfully\n");
+	/* Following code is part of probe routine. */
 	/* Allocate driver data */
 	spidev = kzalloc(sizeof(*spidev), GFP_KERNEL);
 	if (!spidev)
 		return -ENOMEM;
 
+	printk(KERN_INFO "kzalloc completed successfully\n");
 	/* Initialize the driver data */
 	spidev->spi = spi;
 	spin_lock_init(&spidev->spi_lock);
@@ -709,22 +763,43 @@ static int spidev_probe(struct spi_device *spi)
 	if (status == 0) {
 		set_bit(minor, minors);
 		list_add(&spidev->device_entry, &device_list);
+		printk(KERN_INFO "device_create completed successfully\n");
 	}
 	mutex_unlock(&device_list_lock);
 
 	spidev->speed_hz = spi->max_speed_hz;
 
-	if (status == 0)
+	if (status == 0) {
 		spi_set_drvdata(spi, spidev);
-	else
+		printk(KERN_INFO "spi_set_drvdata completed\n");
+	}
+	else{
 		kfree(spidev);
+	}
+
+	status = spi_setup( spi );
+
+	if( status ){
+		printk(KERN_INFO "spi_setup failed\n");
+		spi_unregister_device( spi );
+	}
+	else
+		printk( KERN_INFO "SamCon registered to SPI bus %u, chipselect %u\n",
+			spi_device_info.bus_num, spi_device_info.chip_select );
+
+	/*End probe*/
 
 	return status;
 }
+module_init(spidev_init);
 
-static int spidev_remove(struct spi_device *spi)
+static void __exit spidev_exit(void)
 {
 	struct spidev_data	*spidev = spi_get_drvdata(spi);
+
+	if(spidev){
+		printk(KERN_INFO "spidev is not NULL\n");
+	}
 
 	/* make sure ops on existing fds can abort cleanly */
 	spin_lock_irq(&spidev->spi_lock);
@@ -734,88 +809,28 @@ static int spidev_remove(struct spi_device *spi)
 	/* prevent new opens */
 	mutex_lock(&device_list_lock);
 	list_del(&spidev->device_entry);
+	printk(KERN_INFO "list_del completed\n");
+
+	spi_unregister_device(spi);
+	printk(KERN_INFO "spi_unregister_device completed\n");
+
 	device_destroy(spidev_class, spidev->devt);
+	printk(KERN_INFO "device_destroy completed\n");
+
 	clear_bit(MINOR(spidev->devt), minors);
 	if (spidev->users == 0)
 		kfree(spidev);
 	mutex_unlock(&device_list_lock);
 
-	return 0;
-}
-
-static struct spi_driver spidev_spi_driver = {
-	.driver = {
-		.name =		"spidev",
-	},
-	.probe =	spidev_probe,
-	.remove =	spidev_remove,
-
-	/* NOTE:  suspend/resume methods are not necessary here.
-	 * We don't do anything except pass the requests to/from
-	 * the underlying controller.  The refrigerator handles
-	 * most issues; the controller driver handles the rest.
-	 */
-};
-
-/*-------------------------------------------------------------------------*/
-
-static int __init spidev_init(void)
-{
-	int status;
-	struct spi_master *master;
-
-	/* Claim our 256 reserved device numbers.  Then register a class
-	 * that will key udev/mdev to add/remove /dev nodes.  Last, register
-	 * the driver which manages those device numbers.
-	 */
-	BUILD_BUG_ON(N_SPI_MINORS > 256);
-	status = register_chrdev(SPIDEV_MAJOR, "spi", &spidev_fops);
-	if (status < 0)
-		return status;
-
-	spidev_class = class_create(THIS_MODULE, "spidev");
-	if (IS_ERR(spidev_class)) {
-		unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
-		return PTR_ERR(spidev_class);
-	}
-
-	status = spi_register_driver(&spidev_spi_driver);
-	if (status < 0) {
-		class_destroy(spidev_class);
-		unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
-	}
-
-	// call probe here.
-
-	master = spi_busnum_to_master( samcon_device_info.bus_num );
-	if( !master )
-		return -ENODEV;
-
-	samcon_device = spi_new_device( master, &samcon_device_info );
-	if( !samcon_device )
-		return -ENODEV;
-
-	status = spi_setup( samcon_device );
-
-	if( status )
-		spi_unregister_device( samcon_device );
-	else
-		printk( KERN_INFO "SamCon registered to SPI bus %u, chipselect %u\n",
-			1, 1 );
-
-	return status;
-}
-module_init(spidev_init);
-
-static void __exit spidev_exit(void)
-{
 	spi_unregister_driver(&spidev_spi_driver);
+	printk(KERN_INFO "spi_unregister_driver completed\n");
 	class_destroy(spidev_class);
+	printk(KERN_INFO "class_destroy completed\n");
 	unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
+	printk(KERN_INFO "unregister_chrdev completed\n");
 }
 module_exit(spidev_exit);
 
-MODULE_AUTHOR("Andrea Paterniani, <a.paterniani@swapp-eng.it>");
+MODULE_AUTHOR("Don Michael <donmichael013@gmail.com>");
 MODULE_DESCRIPTION("User mode SPI device interface");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("spi:spidev");
