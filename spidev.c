@@ -55,7 +55,7 @@ static struct spi_device *spi;
 struct spi_board_info spi_device_info = {
 		.modalias = "spidev",
 		.max_speed_hz = 10000000,
-		.bus_num = 1,
+		.bus_num = 3,
 		.chip_select = 1,
 		.mode = 0,
 };
