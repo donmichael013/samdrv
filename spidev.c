@@ -811,13 +811,13 @@ static void __exit spidev_exit(void)
 	list_del(&spidev->device_entry);
 	printk(KERN_INFO "list_del completed\n");
 
+	device_destroy(spidev_class, spidev->devt);
+	printk(KERN_INFO "device_destroy completed\n");
+	
 	spi_unregister_device(spi);
 	printk(KERN_INFO "spi_unregister_device completed\n");
 
-	device_destroy(spidev_class, spidev->devt);
-	printk(KERN_INFO "device_destroy completed\n");
-
-	clear_bit(MINOR(spidev->devt), minors);
+		clear_bit(MINOR(spidev->devt), minors);
 	if (spidev->users == 0)
 		kfree(spidev);
 	mutex_unlock(&device_list_lock);
